@@ -1,0 +1,77 @@
+DEBUG
+
+
+FRONTEND
+- Get Location and fetch events data of that city.
+- On Horizontal sliders like 'Trending' and 'Happening Soon', only few things will be visible with rectangular tiles with  Thumbnail, Name at the below, Date & Time as subheading below Name.
+- On detailed page below or vertical slider, there will be cards with display of all the details fetched. Keep extensive filtering options for this section.
+- Search bar. Debounce of 300ms and call API.
+- In Events Page, give a button of select seats. And conect to ws. dark grey = seat booked, light grey = seat reserved, green = seat reserved by 'this' user, 'orange' with light sweep (which shows processing state) = requested to lock when clicked.
+
+
+BACKEND
+1. Main Service:
+- Stack: Express.js
+
+Auth
+- /register, /login. JWT session with 2 hrs session.
+Store: {id, name, email (optional), location, address, username, mobile (optional), hashed_password}
+
+- get /events/{location}. DB table of 'events' will have:
+{id, code, name, description, artists, date_time, venue, location, total_seats, available_seats, bannerurl, thumbnailurl}
+On /events, everything will be fetched. code is like username, for easy sharing of events.
+
+- get /search/{static filters like (location, has_artist, code, date and time window), text_query}. Note that there is no implicit filter of location here, it acts on entire search space. 
+
+
+2. BoSS Service (Booking + Server streaming):
+- Stack: Go
+
+- ws connection /stream/eventid
+i. first interaction for auth.
+ii. Get entire status of seats from redis (<evenid>:status) and send it to user. Frontend will handle converting bits to UI.
+(If redis key doesn't exist: )
+iii. Run a inner goroutine to fetch status from redis every 30sec by key: <evenid>:status and send the status to user using ws conncetion. Using format from send_status.json having fields {latest_status= bitmapString}. Forntend will handle bits to status conversion.
+iv. subscribe to redis pub/sub with eventid as channel.
+v. On msg recvd from pubsub, push the update to user through ws. Format: to_user_seat_update.json with fields (seat_num, new_status=0,1,2)
+vi. On msg receival from user. User can only send the messages in ws to request a lock or unlock to a seat, msg will be: {reqid, seat_num = [], lock_value=0 or 1}. 0 for unlock, 1 for lock.
+    On receiving this json:
+    Case 1, Lock: (new value 1)
+    a. atomic execution to redis using Lua script to check and lock for all the asked seats. Check using bit read of bitmap. Then lock for the unlocked seats <evenid>:lock:<seat_num>, with TTL of LOCK_TTL (env variable).
+    b. On response, respond to user with format to_user_response.json containing {reqid, success=partial/true/false, lock_failed = []}
+    c. If true, then publish the lock event to the pubsub channel named by <eventid>. {seat_num = [], lock_value=1}
+    d. Store the seatids locally in the array.
+
+    Case 2, Unlock: (new value 0)
+    a. unlock seats by simple native redis setbit and also by clear the key <eventid>:lock:<seat_num>.
+    b. then push the unlock event to pubsub channel <eventid>, msg: {seat_num = [], lock_value=0}
+
+    Case 3, Book: (new value 2)
+    a. Create row in 'bookings'.
+    b. Start call to payment gateway.
+    c. Confirm payment status
+    d. On confirmation, do {
+        a. atomic Lua script to check lock existence and update book status. And non Lua script comds to clear locks of the seats at key <eventid>:lock:<seat_num>
+        b. add rows to the DB 'seats_booked' and 'bookings' and return booking ID.
+    }
+vii. On ws disconnect:
+    a. unlock all locked seats stored in the array. Simple native redis setbit.
+    b. On response, push the unlock event to pubsub.
+
+
+- Delete /eventid/cancel/{seats={_,_,_...}} or Delete /eventid/cancel/booking/{bookingid}
+i. Do DB logical deletion, just change the status in 'seats_booked', if entire booking is deleted then also update the row of 'bookings'
+ii. Update Redis state with new seats states of 0.
+
+Redis:
+<eventid>:status:<BitMap>. num of bits = 2*(num of total_seats).
+PubSub of each event is created. Where events are either locks or unlocks of specific seat number.
+Expiration of locks is sent to a PubSub channel: 'unlocked'.
+
+3. Unlocker
+- Stack: Go
+
+- It just consumes the redis pubub of keysapce notifications and pushes those notifications. And after consuming, it does this sequentially: 
+[Consume key of TTL, key will be in the form of <eventid>:lock:<seat_num>]
+i. Updates bitmap at key <eventid>:status to unlock, by native bitset. (Checking not required)
+ii. Publishes this to pubsub of channel name <eventid>
