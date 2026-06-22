@@ -1,6 +1,6 @@
 # EvenX - Event Booking System
 
-[Demo Video](#) | [Bird's Eye View of Architecture](#) | [Sequence Diagram](#) | [Deployed Link](#)
+[Demo Video](#) | [Sequence Diagram](#) | [Deployed Link](#)
 
 ---
 
@@ -19,9 +19,10 @@
 ### Future Scope
 * **Eliminate False negatives**: False negatives can happen in 2 cases:
     * *Case 1: Redis Pod crashes.* This results in the clearance of all locked seats. Of course, booked seats do not get affected from this.
+    - This can be acceptable. Or can be handled using redis replicas and query mirroring.
     * *Case 2: Unlocker service lost.* If the unlocker service crashes, then due to the fire-and-forget nature of keyspace notifications, notifications are lost.
-* This can be eliminated or heavily narrowed by a distributed fleet of unlocker pods and using leader consensus to keep a single listener.
-* Also, a cron job may run every few hours to read the entire Redis data and restore the state in the `seat_map` model.
+    - This can be eliminated or heavily narrowed by a distributed fleet of unlocker pods and using leader consensus to keep a single listener.
+    - Also, a cron job may run every few hours to read the entire Redis data and restore the state in the `seat_map` model.
 
 ### Assumptions
 * False positive of lock state is strictly avoided. But, false negatives are assumed to be acceptable, at least for some time until the state is refreshed.
@@ -31,7 +32,18 @@
 
 ## 🚀 Project Overview
 
-EvenX is a high-performance, full-stack event booking platform built to handle massive concurrency without overselling. It seamlessly manages high-demand booking windows utilizing atomic "check-and-write" locks, interactive live seat-maps, and separated real-time event streaming.
+- **Full-stack event booking platform** — React frontend, an Express.js + Sequelize main API, and two Go microservices (`statesync`, `restorer`) coordinating through Redis for real-time seat/capacity state.
+- **Two booking models per event** (`events.model`):
+  - `general` — count-based seat booking (pick a number of seats, no individual seat identity). Covers the assessment's core requirement.
+  - `seat_map` — interactive, multi-user seat map with live per-seat locking over WebSocket. Built as an enhancement beyond the brief.
+- **Auth** — JWT register/login/logout. Logout is server-enforced via a Redis token-denylist (`jti`-keyed), not just deleting the token client-side.
+- **No-oversell guarantee by construction** — every seat/count hold is acquired through a single atomic Redis Lua script at lock time (check + decrement in one round trip, no read-then-write race). Checkout never re-checks availability; it only converts an already-held lock into a permanent booking — so overselling isn't just validated against, it's structurally impossible.
+- **Real-time sync** — `statesync` (Go) fans out live seat/availability deltas to every connected client over WebSocket via Redis Pub/Sub. `restorer` (Go) reclaims abandoned locks automatically via Redis keyspace-expiry notifications — no polling, no manual cleanup.
+- **Checkout** — one synchronous endpoint backed by a fake, always-succeeding payment gateway. No webhook, no async confirmation step (deliberate scope cut, documented in Assumptions).
+- **Self-healing state** — if Redis is ever lost or evicted, `avlbl`/`book`/the seat bitmap are exactly rehydrated from Postgres on next access; no in-flight locks need to survive (they're recomputed correctly without them).
+- **Containerized** — each of the three backend services has its own self-contained Dockerfile (no shared build context); one script builds and pushes all three.
+- **Frontend** — location-aware event feed, trending/upcoming sliders, debounced search with filters, and the live seat-map UI for `seat_map` events.
+
 
 ## 💻 Tech Stack
 
