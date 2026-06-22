@@ -1,6 +1,6 @@
 # EvenX - Event Booking System
 
-[Demo Video](#) | [Sequence Diagram](#) | [Deployed Link](#)
+[Demo Video](#) | [Sequence Diagram](https://mermaid.ai/d/a2b0be97-8a8a-430a-a111-16531251cebc) | [Deployed Link](http://16.112.64.12/evenx/)
 
 ---
 
