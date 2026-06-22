@@ -94,6 +94,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		ws.Close()
 		return
 	}
+
+	debugPrintf("[statesync] handleStream: user %s connected to event stream %s", c.userID, c.eventID)
+
 	var first clientMsg
 	if json.Unmarshal(data, &first) != nil || first.Token == "" {
 		_ = ws.WriteMessage(websocket.CloseMessage,
@@ -101,13 +104,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		ws.Close()
 		return
 	}
+
+	debugPrintf("[statesync] handleStream: received auth token from user %s for event stream %s", c.userID, c.eventID)
+
 	userID, err := verifyToken(context.Background(), s.rdb, s.cfg.JWTSecret, first.Token)
 	if err != nil {
+		debugPrintf("[statesync] handleStream: auth failed for event stream %s: %v", c.eventID, err)
+
 		_ = ws.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "unauthorized"))
 		ws.Close()
 		return
 	}
+
+	debugPrintf("[statesync] handleStream: auth successful for user %s on event stream %s", userID, c.eventID)
 	c.userID = userID
 	_ = ws.SetReadDeadline(time.Time{}) // clear deadline for the lifetime of the conn
 
@@ -116,6 +126,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// Ensure Redis state exists (rehydrate on cache miss) and learn the model.
 	model, err := getOrRehydrate(ctx, s.rdb, s.db, eventID)
 	if err != nil {
+		debugPrintf("[statesync] handleStream: failed to get/rehydrate state for event stream %s: %v", c.eventID, err)
 		ws.Close()
 		return
 	}
@@ -125,9 +136,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// is guaranteed to be the first frame, THEN attach to the hub and start the
 	// writer. Any delta in the microsecond gap is healed by the 30s reconciler.
 	if err := s.sendInit(ctx, c); err != nil {
+		debugPrintf("[statesync] handleStream: failed to send init for event stream %s: %v", c.eventID, err)
 		ws.Close()
 		return
 	}
+	debugPrintf("[statesync] handleStream: sending init message to user %s on event stream %s", c.userID, c.eventID)
 	s.mgr.attach(eventID, model, c)
 	go c.writePump()
 
@@ -136,8 +149,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// Teardown: stop receiving, run abandonment cleanup unless DONE was received.
 	s.mgr.detach(c)
 	if !c.released {
+		debugPrintf("[statesync] handleStream: user %s disconnected without DONE from event stream %s, running abandonment cleanup", c.userID, c.eventID)
 		s.abandon(ctx, c)
 	}
+	debugPrintf("[statesync] handleStream: user %s disconnected from event stream %s", c.userID, c.eventID)
 	close(c.done)
 	ws.Close()
 }
@@ -149,6 +164,7 @@ func (s *Server) sendInit(ctx context.Context, c *Conn) error {
 	if c.model == string(models.EventModelSeatMap) {
 		bitmap, err := s.rdb.Get(ctx, kStatus(c.eventID)).Bytes()
 		if err != nil && err != redis.Nil {
+			debugPrintf("[statesync] sendInit: failed to get seatmap status for event stream %s: %v", c.eventID, err)
 			return err
 		}
 		b = mustJSON(initSeatmap{Type: typeInit, Bitmap: base64.StdEncoding.EncodeToString(bitmap)})
@@ -167,6 +183,8 @@ func (s *Server) readLoop(ctx context.Context, c *Conn) {
 		if err != nil {
 			return
 		}
+
+		debugPrintf("[statesync] readLoop: received message from user %s on event stream %s: %s", c.userID, c.eventID, string(data))
 		var m clientMsg
 		if json.Unmarshal(data, &m) != nil {
 			continue
@@ -200,6 +218,8 @@ func (s *Server) lockSeatmap(ctx context.Context, c *Conn, m *clientMsg) {
 	for _, seat := range m.SeatNum {
 		args = append(args, seat)
 	}
+
+	debugPrintf("[statesync] lockSeatmap: user %s requested seats %v for event %s", c.userID, m.SeatNum, c.eventID)
 	raw, err := luaLockSeatmap.Run(ctx, s.rdb,
 		[]string{kStatus(c.eventID), kAvlbl(c.eventID)}, args...).Result()
 	if err != nil {
@@ -208,6 +228,7 @@ func (s *Server) lockSeatmap(ctx context.Context, c *Conn, m *clientMsg) {
 	}
 	arr, _ := raw.([]interface{})
 	if len(arr) == 0 || asInt(arr[0]) != 1 {
+		debugPrintf("[statesync] lockSeatmap: user %s failed to lock seats %v for event %s, Lua returned %v", c.userID, m.SeatNum, c.eventID, arr)
 		failed := make([]int, 0, len(arr)-1)
 		for _, v := range arr[1:] {
 			failed = append(failed, asInt(v))
@@ -236,6 +257,7 @@ func (s *Server) unlockSeatmap(ctx context.Context, c *Conn, m *clientMsg) {
 	for _, seat := range released {
 		_ = s.rdb.Publish(ctx, chPubsub(c.eventID), mustJSON(deltaSeat{SeatNum: seat, NewStatus: 0})).Err()
 	}
+	debugPrintf("[statesync] unlockSeatmap: user %s released seats %v for event %s", c.userID, released, c.eventID)
 }
 
 // releaseSeats runs the ownership-checked unlock Lua and updates the conn's set.
@@ -266,6 +288,8 @@ func (s *Server) lockGeneral(ctx context.Context, c *Conn, m *clientMsg) {
 		c.enqueue(mustJSON(lockAck{Reqid: m.Reqid, Success: false}))
 		return
 	}
+
+	debugPrintf("[statesync] lockGeneral: user %s requested %d seats for event %s", c.userID, n, c.eventID)
 	raw, err := luaLockGeneral.Run(ctx, s.rdb,
 		[]string{kAvlbl(c.eventID), kBook(c.eventID)},
 		kLockCount(c.eventID, n, c.userID), n, s.cfg.LockTTL).Result()
@@ -283,6 +307,8 @@ func (s *Server) lockGeneral(ctx context.Context, c *Conn, m *clientMsg) {
 	book := asInt64(arr[2])
 	c.enqueue(mustJSON(lockAck{Reqid: m.Reqid, Success: true, Avlbl: &avlbl}))
 	_ = s.rdb.Publish(ctx, chPubsub(c.eventID), mustJSON(deltaGeneral{Avlbl: avlbl, Book: book})).Err()
+
+	debugPrintf("[statesync] lockGeneral: user %s successfully locked %d seats for event %s, avlbl now %d", c.userID, n, c.eventID, avlbl)
 }
 
 // abandon releases everything this conn still holds when it disconnects without DONE.

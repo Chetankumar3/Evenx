@@ -193,7 +193,7 @@ function BookingCard({ booking, busy, onCancelWhole, onCancelSeats }) {
             onClick={onCancelWhole}
             disabled={busy}
           >
-            {busy ? 'Cancelling…' : 'Cancel whole booking'}
+            {busy ? 'Cancelling…' : 'Cancel booking'}
           </button>
 
           {isSeatMap && !picking && (

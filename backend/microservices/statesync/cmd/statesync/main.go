@@ -10,13 +10,21 @@ import (
 	_ "github.com/lib/pq"
 )
 
+const DEBUG_MODE = true
+
+func debugPrintf(format string, args ...any) {
+	if DEBUG_MODE {
+		log.Printf(format, args...)
+	}
+}
+
 func main() {
 	cfg := loadConfig()
 
 	rdb := newRedis(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Printf("[statesync] warning: redis ping failed: %v", err)
+		debugPrintf("[statesync] warning: redis ping failed: %v", err)
 	}
 	cancel()
 
@@ -38,7 +46,7 @@ func main() {
 	})
 
 	addr := ":" + cfg.Port
-	log.Printf("[statesync] listening on %s", addr)
+	debugPrintf("[statesync] listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("[statesync] server: %v", err)
 	}

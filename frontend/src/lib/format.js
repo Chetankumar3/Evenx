@@ -31,7 +31,7 @@ export function formatMoney(amount) {
   if (amount === undefined || amount === null) return '—'
   const n = Number(amount)
   if (Number.isNaN(n)) return String(amount)
-  return n.toLocaleString(undefined, { style: 'currency', currency: 'USD' })
+  return n.toLocaleString(undefined, { style: 'currency', currency: 'INR' })
 }
 
 export function joinArtists(artists) {

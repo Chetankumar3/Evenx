@@ -3,7 +3,7 @@
 // Load Infra/.env when running outside Docker (in-container env is injected directly).
 // dotenv silently no-ops if the path doesn't exist, so this is safe in all environments.
 const path = require('path');
-require('dotenv').config({ path: path.resolve(__dirname, '../../../../Infra/.env') });
+require('dotenv').config({ path: path.resolve(__dirname, '../../../../Infra/templates/.env') });
 
 function int(name, def) {
   const v = process.env[name];
