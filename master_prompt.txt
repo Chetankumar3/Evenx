@@ -1,0 +1,346 @@
+================================================================================
+MASTER PROMPT — EVENX (for local Claude / Claude Code)
+================================================================================
+You are implementing a full-stack Event Booking System. Everything you need
+is below or in the two reference files named explicitly. Do not redesign,
+substitute, or "improve" anything specified here — follow it exactly. If
+something genuinely isn't covered below, stop and ask rather than guessing.
+
+This file is the only thing you need to follow step by step. plan.txt in the
+same drop is the longer architecture rationale (why), this file is the build
+spec (what, in order). If the two ever conflict, THIS FILE WINS.
+
+--------------------------------------------------------------------------------
+0. STACK — fixed, no substitutions
+--------------------------------------------------------------------------------
+- main:      Node.js + Express.js + Sequelize (Postgres/MySQL — pick Postgres
+             unless told otherwise; the SQL snippets below assume Postgres).
+- statesync: Go.
+- restorer:  Go.
+- frontend:  React.js and Tailwind.
+- Redis: shared by main, statesync, restorer (locks, pubsub, keyspace notifs).
+- No shared code directory between the three backend services. None.
+
+--------------------------------------------------------------------------------
+1. REPO LAYOUT — exact
+--------------------------------------------------------------------------------
+backend/
+  microservices/
+    main/         Express app. Contains models.js (already provided — use
+                  it as-is, do not regenerate). Add: src/, package.json,
+                  Dockerfile (already provided).
+    statesync/    Go module. Contains models.go (already provided, READ-ONLY
+                  use, rehydration queries only). Add: cmd/statesync/,
+                  go.mod, go.sum, Dockerfile (already provided).
+    restorer/     Go module. No DB, no auth, no models file at all — pure
+                  Redis in/out. Add: cmd/restorer/, go.mod, go.sum,
+                  Dockerfile (already provided).
+  build_and_push.sh   (already provided — do not edit unless adding a 4th
+                       service later.)
+frontend/         React app, your structure, no constraint beyond Sec.6 below.
+
+--------------------------------------------------------------------------------
+2. DATABASE SCHEMA — already written, use as-is
+--------------------------------------------------------------------------------
+backend/microservices/main/models.js       -> Sequelize, 4 tables: user,
+                                               events, bookings, seats_booked.
+backend/microservices/statesync/models.go  -> Go structs mirroring the same
+                                               3 of those 4 tables (no user
+                                               struct needed there).
+Rules baked into both files already — do not change them:
+  - No ORM associations / no Go-side joins via struct tags that imply FKs.
+    Plain FK integer columns. Write explicit JOINs in your queries.
+  - seats_booked has NO unique constraint on (event_id, seat_num). Redis is
+    the double-booking guard, not the DB. Don't add one.
+  - Rows in seats_booked are soft-deleted on cancellation, never hard-deleted.
+    Just change the column 'cancelled' to true.
+
+--------------------------------------------------------------------------------
+3. AUTH — single spec, implement natively in BOTH main and statesync
+--------------------------------------------------------------------------------
+No shared auth file. Implement this exact logic twice, once per language.
+Shared between them: only the JWT_SECRET env var value and the Redis instance.
+
+Claims:  { sub: <userId>, jti: <uuid>, iat, exp }   exp = iat + 2h, HS256.
+
+main — issue (on /register and /login success):
+  pseudo:
+    token = jwt.sign({ sub: user.id, jti: uuid4() }, JWT_SECRET, { expiresIn: '2h' })
+    respond 200 { token }
+
+main — verify (Express middleware, every route EXCEPT GET /events, 
+  GET /event_details/:id and GET /search):
+  pseudo:
+    token  = req.headers.authorization?.replace('Bearer ', '')
+    if (!token) return res.status(401).end()
+    claims = jwt.verify(token, JWT_SECRET)              // 401 on throw
+    if (await redis.exists(`jwt:denylist:${claims.jti}`)) return res.status(401).end()
+    req.userId = claims.sub
+    next()
+
+main — logout:
+  pseudo:
+    ttl = claims.exp - nowInSeconds()
+    await redis.setex(`jwt:denylist:${claims.jti}`, ttl, "1")
+    respond 200
+
+statesync — verify (first msg auth prototocl, accept all ws, then use first message for auth with 10s timeout):
+  pseudo:
+    claims, err := jwt.Verify(token, JWT_SECRET)
+    if err != nil { reject upgrade with 401 }
+    exists, _ := redisClient.Exists(ctx, "jwt:denylist:"+claims.Jti).Result()
+    if exists > 0 { reject upgrade with 401 }
+    conn.userID = claims.Sub
+
+GET /events, GET /event_details/:id and GET /search are the ONLY three 
+unauthenticated routes anywhere in the system. Every other route, every WS 
+connection, requires a valid, non-denylisted JWT.
+Auth in WS connection happens in First msg. So, accept all ws, then use first message for auth.
+
+--------------------------------------------------------------------------------
+4. REDIS SCHEMA — exact keys, do not rename or restructure
+--------------------------------------------------------------------------------
+Shared by both booking models, created when an event is seeded or lazily on
+first access if missing (see Sec.9, rehydration):
+  <eventid>:model:<type>   string, 'general' | 'seat_map'
+  <eventid>:total          int, = events.total_seats
+  <eventid>:avlbl          int, init = total
+  <eventid>:book           int, init = 0
+  pubsub channel <eventid> broadcasts state deltas, both models use it
+
+seat_map model ONLY:
+  <eventid>:status         Bitmap, 2 bits/seat: 00=empty 01=locked 10=booked
+  <eventid>:lock:<seat_num>    ephemeral string, value=<userid>, EX=LOCK_TTL
+                           (LOCK_TTL = env variable)
+  keyspace notif on <eventid>:lock:<seat> expiry
+
+general model ONLY:
+  <eventid>:lock:<count>:<userid>   ephemeral string, value="true",
+                                     EX=LOCK_TTL (10min)
+  keyspace notif on <eventid>:lock:<count>:<userid> expiry
+  IMPORTANT: count and userid live IN THE KEY NAME on purpose. A Redis
+  keyspace-expiry notification gives you the key name only, never the value
+  that just expired — encoding count+owner in the name is how restorer
+  recovers both on expiry without a second non-expiring lookup table. Do
+  not "simplify" this back to <eventid>:lock:<userid>=N — that breaks expiry
+  recovery.
+
+--------------------------------------------------------------------------------
+5. MAIN SERVICE — exact endpoints
+--------------------------------------------------------------------------------
+Auth      POST /register                body: {name,email,username,mobile,
+                                         location,address,password}
+          POST /login                   body: {username|email, password}
+          POST /logout                  auth required
+
+Events    GET  /events?location=&...    PUBLIC. location optional, never
+                                         required — no location -> full list.
+          GET  /event_details/:id       PUBLIC.
+          GET  /search?location=&has_artist=&code=&date_from=&date_to=&q=
+                                         PUBLIC. query params, not body (cacheable).
+
+Bookings  POST /events/:eventid/checkout
+            body general:  { num_seats }
+            body seat_map: { seat_nums: [...] }
+            -> see Sec.7 pseudocode. Synchronous. No webhook, no real gateway.
+
+          DELETE /events/:eventid/cancel/:bookingid
+            cancels whole booking, both models. body: none.
+
+          DELETE /events/:eventid/cancel
+            body: { seat_nums: [...] }   seat_map ONLY, partial cancel.
+            Reject with 400 if event.model == 'general'.
+
+          GET /user/bookings/:userid
+            MUST verify :userid == req.userId (from JWT) before querying.
+            Any mismatch -> 403. Never trust the path param alone.
+
+--------------------------------------------------------------------------------
+6. STATESYNC — WS protocol & Lua Script (Locking)
+--------------------------------------------------------------------------------
+Endpoint: GET /stream/:eventid (upgrades to WS after Sec.3 auth check).
+On connect:
+  seat_map -> send { type: "INIT", bitmap: <string> }
+  general  -> send { type: "INIT", avlbl: <int>, book: <int> }
+  Then subscribe the connection to Redis pubsub channel <eventid>.
+
+Client -> server messages:
+  seat_map: { reqid, action: "LOCK" | "UNLOCK", seat_num: [int, ...] }
+  general:  { reqid, action: "LOCK", num_seats: <int> }
+  BOTH:     { reqid, action: "DONE" }   <- graceful-close handshake, see below
+
+LUA SCRIPT PSEUDOCODE FOR LOCKING (Run via EVAL):
+  seat_map LOCK: 
+    For each `seat` in payload:
+      if bitmap[seat] == 00 (empty):
+        bitmap[seat] = 01 (locked)
+        SETEX <eventid>:lock:<seat_num> = <userid>
+        avlbl -= 1
+      else:
+        abort the entire script, return failure (atomic rollback).
+  general LOCK:
+    if avlbl >= num_seats:
+      avlbl -= num_seats
+      SETEX <eventid>:lock:<num_seats>:<userid> = "true"
+      return success
+    else: 
+      return failure
+
+Server -> client messages:
+  LOCK ack:    { reqid, success: bool, avlbl?: int, failed_seats?: [int,...] }
+  UNLOCK ack:  { reqid, success: bool }
+  pubsub delta, seat_map: { seat_num: int, new_status: 0|1|2 }
+  pubsub delta, general:  { avlbl: int, book: int }
+
+GRACEFUL-CLOSE HANDSHAKE (applies to both models, implement exactly this):
+  1. Client sends a successful LOCK.
+  2. Client sends { reqid, action: "DONE" }.
+  3. Server marks this connection's locks as "released" internally (a bool
+     flag on the connection struct), does NOT touch Redis for this.
+  4. Server then closes the socket.
+  5. On WS close: if the "released" flag is set, do nothing further. If it
+     is NOT set (no DONE received), run abandonment cleanup — release every 
+     lock this connection is holding, immediately (using manual UNLOCK). Each WS  connection maintains an in-memory set of currently-held seat locks
+for seat_map events and the currently-held count-lock for general events.
+
+Successful LOCK adds ownership to this set.
+Successful UNLOCK removes ownership from this set.
+
+Disconnect cleanup operates only on the locks still present in this
+connection-local ownership set.
+
+Reconciler: one goroutine per active event, runs every 30s. Get the <eventid>:status for seat_map model and <eventid>:avlbl for general model to refresh the state.
+general: SCAN <eventid>:lock:*, sum counts parsed from key names,
+  recompute avlbl_check = total - book - sum, fix drift, push.
+
+--------------------------------------------------------------------------------
+7. CHECKOUT — Lua Script verification (lives in main)
+--------------------------------------------------------------------------------
+  function checkout(eventId, userId, body):
+    event = Event.findByPk(eventId)
+    
+    if event.model == 'seat_map':
+      seatNums = body.seat_nums
+      
+      // ATOMIC LUA SCRIPT FOR SEAT_MAP CHECKOUT
+      ok = luaScript_VerifyAndBookSeats(eventId, userId, seatNums)
+        # Inside the Lua script, atomically:
+        #   for each seat in seatNums: 
+        #       if GET <eventid>:lock:<seat_num> != userId:
+        #           return false (abort, lock missing or owned by someone else)
+        #   if all match: 
+        #       for each seat in seatNums:
+        #           bitmap[seat] = 2
+        #           DEL <eventid>:lock:<seat_num>
+        #       book += len(seatNums)
+        #       return true
+        
+      if not ok: return 409 "session expired"
+      
+      booking = Booking.create({userId, eventId, numSeats: seatNums.length, status: 'confirmed', paymentRef: `FAKE-${uuid4()}`})
+      for seat in seatNums: SeatBooked.create({bookingId: booking.id, eventId, seatNum: seat})
+      publish(eventId, seatNums.map(s => ({seat_num: s, new_status: 2})))
+      return 200 booking
+
+    else: # general
+      n = body.num_seats
+      key = `${eventId}:lock:${n}:${userId}`
+      
+      // ATOMIC LUA SCRIPT FOR GENERAL CHECKOUT
+      ok = luaScript_VerifyAndBookCount(key)
+        # Inside the Lua script, atomically:
+        #   if EXISTS(key): 
+        #       DEL(key)
+        #       book += n
+                return 
+                {
+                  success: true,
+                  avlbl: current_avlbl,
+                  book: current_book
+                }
+        #   else: 
+        #       return false (abort, lock expired)
+        
+      if not ok: return 409 "session expired"
+      
+      booking = Booking.create({userId, eventId, numSeats: n, status: 'confirmed', paymentRef: `FAKE-${uuid4()}`})
+      publish(eventId, {avlbl: <current>, book: <current>})
+      return 200 booking
+
+  Neither branch touches avlbl. It was already decremented at LOCK time in
+  statesync. Checkout only converts an existing hold into a permanent row.
+
+--------------------------------------------------------------------------------
+8. RESTORER — pseudocode, the whole service
+--------------------------------------------------------------------------------
+  subscribe to "__keyevent@0__:expired"
+  for each expired key name K:
+    parts = K.split(":")
+    eventId = parts[0]
+
+    if parts[1] == "lock" and len(parts) == 3:        # seat_map: ev:lock:<seat_num>
+      seatNum = parts[2]
+      pipeline:
+        bitfield SET <eventId>:status seat -> 0
+        INCR <eventId>:avlbl
+      publish(eventId, { seat_num: seatNum, new_status: 0 })
+
+    elif parts[1] == "lock" and len(parts) == 4:       # general: ev:lock:<N>:<userid>
+      n = int(parts[2])
+      INCRBY <eventId>:avlbl n
+      publish(eventId, { avlbl_delta: n })
+
+  No DB calls anywhere in this service. No JWT/auth code anywhere in this
+  service. If you find yourself adding either, stop — that's a sign you've
+  drifted from spec.
+
+--------------------------------------------------------------------------------
+9. REHYDRATION — when Redis state is missing
+--------------------------------------------------------------------------------
+Triggered in statesync, on connect, if <eventid>:total is missing:
+  total = events.total_seats (from DB)
+  if event.model == 'general':
+    book = SUM(bookings.num_seats WHERE event_id=eventId AND status='confirmed')
+  else:
+    book = COUNT(seats_booked WHERE event_id=eventId AND cancelled=false)
+  avlbl = total - book
+  SET <eventid>:total, <eventid>:avlbl, <eventid>:book accordingly.
+  if seat_map: also rebuild the bitmap string — set bit=2 for every seat_num
+  in seats_booked for this event (where cancelled=false), bit=0 for every other seat.
+
+--------------------------------------------------------------------------------
+10. BUILD ORDER — follow this exact sequence, do not skip
+--------------------------------------------------------------------------------
+  1. DB schema migration from models.js (main) — run it, confirm tables exist.
+  2. Auth implementation (main & Go natively): register, login, logout, middleware (Sec.3).
+  3. Events endpoints: GET /events, GET /event_details/:id, GET /search (Sec.5).
+  4. Build statesync (Go) & restorer (Go) foundations. Wire them to the same Redis.
+  5. Implement Rehydration (Sec.9) in statesync — triggered right before a user connects to a WS room if Redis state is null.
+  6. Statesync WS protocol: implement auth check, room subscription, and the atomic Lua LOCK/UNLOCK logic for BOTH models (Sec.6). 
+  7. Checkout endpoints (main): implement the Lua verification step (Sec.7) for both models.
+  8. Cancel endpoints (main): logic for full cancel and partial seat_map cancel.
+  9. GET /user/bookings/:userid (main) with the explicit ownership check.
+  10. Frontend: seat map UI + general UI + WS client + graceful-close handshake (Sec.6).
+  11. Containerize: Use provided Dockerfiles and build_and_push.sh. Wire each service's entrypoint path to match the existing Dockerfiles.
+
+--------------------------------------------------------------------------------
+11. DO NOT — explicit guardrails
+--------------------------------------------------------------------------------
+- Do NOT implement a real payment gateway or any webhook. Checkout is one
+  synchronous call that always succeeds.
+- Do NOT add Sequelize associations (belongsTo/hasMany) or any Go-side
+  struct relationships. FK columns + explicit joins only.
+- Do NOT create a shared_folder or any cross-service shared code directory.
+  main and statesync each have their own schema file; restorer has none.
+- Do NOT make location a required parameter for listing events.
+- Do NOT trust a :userid path param for "my bookings" without checking it
+  against the authenticated user's JWT subject.
+- Do NOT decrement/increment avlbl or the bitmap anywhere except inside the
+  documented atomic Lua scripts. No plain GET-then-SET from app code.
+- Do NOT let the WS disconnect handler release locks when a prior DONE
+  message was received (Sec.6 graceful-close handshake).
+- Do NOT mix the two models' Redis key sets — general never uses lock:<seat> or the bitmap; seat_map never uses lock:<count>:<userid>.
+- Do NOT change <eventid>:lock:<count>:<userid> back to
+  <eventid>:lock:<userid>=N — this breaks restorer's expiry recovery (Sec.4)
+- Do NOT add endpoints, statuses, or Redis keys beyond what's listed here.
+================================================================================

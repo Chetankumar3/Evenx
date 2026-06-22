@@ -1,0 +1,175 @@
+================================================================================
+EVENT BOOKING SYSTEM - EVENX: FINAL ARCHITECTURE & IMPLEMENTATION PLAN (v4)
+================================================================================
+Two booking models, selected per-event via events.model:
+  - 'general'   -> count-based (per assessment brief). Default/primary model.
+  - 'seat_map'  -> seat-level reservation-based (enhancement).
+Both share the same shape: LOCK (hold capacity via Lua) -> CHECKOUT (verify lock 
+via Lua, fake payment, synchronous call) -> BOOK (finalize). Release on cancel
+or TTL expiry. No oversell in either model because capacity is decremented
+atomically AT LOCK TIME, not at checkout time.
+
+STACK: main = Node.js/Express.js + Sequelize. statesync = Go. restorer = Go.
+No shared code directory between services -- each is fully self-contained.
+
+--------------------------------------------------------------------------------
+1. FRONTEND (React.js)
+--------------------------------------------------------------------------------
+- Location-based fetch for relevant city events (geolocation optional, not required).
+- Home Page: 'Trending' / 'Happening Soon' vertical sliders. Tile = Thumbnail,
+  Event Name, Date & Time.
+- Browse All Events: filters + cards.
+- Search Bar: backend-driven, 300ms debounce.
+- Event Detail Page: GET /event_details/{id}.
+  * model == 'general'  -> seat-count stepper + "Book" button.
+  * model == 'seat_map' -> "Open Seat Map" button -> opens WS.
+- SEAT MAP UI (model == 'seat_map'):
+    Legend: Light Grey=Empty, Orange+sweep=Processing(lock requested),
+            Green=Reserved by me this session, Grey+Lock=Reserved by other,
+            Dark Grey=Booked.
+    Click empty seat -> fires LOCK over WS.
+- GENERAL MODEL UI (model == 'general'):
+    Stepper for seat count -> "Book" click opens WS -> sends LOCK{num_seats}.
+    Button shows "Processing..." until WS ack. On success: client sends a
+    graceful-close control message, disconnects WS, routes to fake checkout page.
+    On failure (insufficient avlbl): show error, stay on page, no WS side effects.
+- FAKE CHECKOUT / PAYMENT PAGE (both models):
+    Shows summary (event, seats/count, amount). Single "Pay" button.
+    Pay click -> ONE call: POST /events/{eventid}/checkout
+      body (seat_map):  { seat_nums: [...] }
+      body (general):   { num_seats: N }
+    Always succeeds server-side (fake gateway). Response success -> route to confirmation.
+    Response failure (lock expired/invalidated) -> route back to event, show "session expired."
+- My Bookings Page: GET /user/bookings/{userid}; cancel booking via DELETE endpoint: DELETE /events/:eventid/cancel/:bookingid. and also can cancel specific seats through endpoint: DELETE /events/:eventid/cancel. Note that if user selects all seats, then call enite booking cancellation ednpoint.
+
+--------------------------------------------------------------------------------
+2. BACKEND: MAIN SERVICE (Node.js / Express.js + Sequelize)
+--------------------------------------------------------------------------------
+AUTH GATING: every endpoint below requires a valid JWT except GET /events, 
+GET /search, and GET /event_details/{id} — those three are public.
+
+AUTH
+- POST /register, POST /login -> issue JWT. 2hr expiry.
+- POST /logout -> writes the Redis denylist entry. NOT client-side-only logout.
+- DB Store: {id, name, email, location, address, username, mobile, hashed_password}.
+
+EVENTS
+- GET /events?location=&...filters   -> full event space if no location given.
+- GET /event_details/{id}            -> single event, full detail.
+- GET /search?location=&has_artist=&... -> Operates over global space. Query params.
+
+BOOKINGS
+- POST /events/{eventid}/checkout
+    Single endpoint, finalizes booking SYNCHRONOUSLY, no webhook.
+    Branches internally on events.model:
+      seat_map: VERIFY locks via Lua script -> matches requested body seat_nums to 
+                redis lock owners (<eventid>:lock:<seat_num> == userid). 
+                If ALL match -> bitmap seat -> 2, DEL lock:<seat>, book += len(seats).
+                If mismatch -> ABORT transaction, return 409 "session expired".
+                Finally: INSERT seats_booked rows, INSERT bookings row.
+      general:  VERIFY lock via Lua script -> client sends num_seats=N; server addresses
+                <eventid>:lock:<N>:<userid> directly. EXISTS check -> book += N, 
+                DEL that key, return true.
+                If mismatch -> ABORT, return 409 "session expired".
+                Finally: INSERT bookings row (no seats_booked rows).
+    avlbl is NOT touched here in either branch — it was already decremented at lock time.
+
+- DELETE /events/{eventid}/cancel/{bookingid}        [canonical, both models]
+    Fetch booking.
+    If model == seat_map: fetch its seats_booked rows, for each: bitmap -> 0, 
+    avlbl += 1, book -= 1, SOFT DELETE seats_booked row (cancelled=true).
+    If model == general: avlbl += booking.num_seats, book -= booking.num_seats.
+    UPDATE bookings.status = 'cancelled'. Publish delta(s) to PubSub <eventid>.
+
+- GET /user/bookings/{userid}
+    Returns all bookings. SECURITY NOTE: validate {userid} against the JWT subject 
+    before querying to prevent IDOR.
+
+--------------------------------------------------------------------------------
+3. BACKEND: STATESYNC SERVICE (Go)
+--------------------------------------------------------------------------------
+One Broadcaster goroutine per active event, fans out to all WS connections
+for that event. /stream/{eventid} branches behavior by events.model.
+
+GRACEFUL-CLOSE HANDSHAKE (applies to BOTH models):
+  Client, after a successful LOCK ack, sends {action:"DONE"} before closing
+  its WS to move to the checkout page. Server marks that connection "released".
+  Any disconnect WITHOUT a prior DONE is treated as abandonment -> release
+  whatever that connection was holding immediately.
+
+SEAT_MAP BRANCH
+  Connect: Fetch <eventid>:status bitmap. If null -> rehydrate (see Sec.5). Send initial state.
+  Client msg: {reqid, seat_num:[], action:"LOCK"|"UNLOCK"}
+    LOCK: Atomic Lua Script:
+          For each requested seat: 
+            if bitmap[seat] == 0: bitmap[seat]=1, SETEX lock:<seat> LOCK_TTL (LOCK_TTL = env variable) userid, avlbl -= 1. 
+            Else: fail transaction.
+    Respond {reqid, success, failed_seats:[]}. Publish per-seat deltas.
+  UNLOCK (manual): verify ownership -> bitmap bit=0, DEL lock:<seat>, avlbl += 1. Publish delta.
+
+GENERAL BRANCH
+  Connect: fetch <eventid>:avlbl and <eventid>:book, push initial counts.
+  Client msg: {reqid, action:"LOCK", num_seats:N}
+    LOCK: Atomic Lua Script:
+          If avlbl >= N: avlbl -= N, SETEX <eventid>:lock:<N>:<userid> = true, TTL=LOCK_TTL (LOCK_TTL = env variable).
+          Else: fail.
+    Respond {reqid, success, avlbl}. Publish avlbl delta.
+
+--------------------------------------------------------------------------------
+4. BACKEND: RESTORER SERVICE (Go)
+--------------------------------------------------------------------------------
+Dedicated consumer for Redis Keyspace Notifications (TTL expirations).
+No DB access, no auth, no shared schema -- pure Redis in/out. 
+
+SEAT_MAP: on <eventid>:lock:<seat> expiry ->
+    bitmap[seat] = 0, avlbl += 1 (native bitfield op + INCR, same pipeline).
+    Publish {seat_num, new_status:0} to PubSub <eventid>.
+
+GENERAL: on <eventid>:lock:<N>:<userid> expiry ->
+    Key name carries both pieces of data the notification doesn't: split it
+    to recover N directly. avlbl += N. Publish {avlbl_delta: +N} to PubSub.
+
+--------------------------------------------------------------------------------
+5. REDIS SCHEMA & REHYDRATION
+--------------------------------------------------------------------------------
+SHARED:
+  <eventid>:model:<type>   -> 'general' | 'seat_map'
+  <eventid>:total          -> int, = events.total_seats
+  <eventid>:avlbl          -> int, init = total
+  <eventid>:book           -> int, init = 0
+SEAT_MAP:
+  <eventid>:status         -> Bitmap, 2 bits/seat
+  <eventid>:lock:<seat>    -> Ephemeral string, EX=LOCK_TTL
+GENERAL:
+  <eventid>:lock:<count>:<userid>  -> Ephemeral string, value=true, EX=600s
+
+REHYDRATION (Lazy Loading on Cache Miss):
+  If <eventid>:total missing: rebuild from DB — total = events.total_seats;
+  book = {
+    general:
+    SUM(bookings.num_seats WHERE status='confirmed')
+
+    seat_map:
+    COUNT(seats_booked WHERE cancelled=false)
+  }. 
+  avlbl = total - book. For seat_map also reconstruct the bitmap string from
+  seats_booked rows.
+
+--------------------------------------------------------------------------------
+6. CORRECTNESS GUARANTEE (overselling)
+--------------------------------------------------------------------------------
+Both models enforce capacity by decrementing avlbl/bitmap at LOCK TIME inside a 
+single atomic Lua EVAL. 
+Checkout verifies ownership of that lock using another atomic Lua EVAL, confirming
+<eventid>:lock:<seat> == userid (or checking the <N> lock key). 
+Because rows in seats_booked are soft-deleted, there is no DB-level unique constraint 
+on (event_id, seat_num). Redis acts as the absolute double-booking guard.
+
+--------------------------------------------------------------------------------
+7. INFRASTRUCTURE: DOCKER & BUILD/PUSH
+--------------------------------------------------------------------------------
+No shared_folder. Each service is fully self-contained in its own folder.
+main/Dockerfile      -> node:20-slim, npm ci, CMD node src/index.js.
+statesync/Dockerfile -> multi-stage: golang:1.22-alpine.
+restorer/Dockerfile  -> same multi-stage Go pattern as statesync.
+================================================================================
