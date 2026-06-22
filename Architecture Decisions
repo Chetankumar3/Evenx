@@ -1,0 +1,22 @@
+Architectural Desicions
+- Consistency: The usage of Lua script for atomic "check-and-write" execution and the overall Design ensures complete conistency against false positives on lock state (locked or booked but shown as unlocked = overselling). Although, stale unlock read i.e false negative is possible (in case of Redis pod crash or keyspace listner service i.e unlocker crashes).
+- Usage of Redis for state tracking helps in:
+i. Avoid DB for state management, which is expensive due to no bit level writes and is also high latency method.
+ii. Redis also acts as low latency Cache for state reads, offloaded reservation expirations.
+- Go stack to handle ws connections using vertical scaling of cores with high conucrrency. Also, bunching helps in reducing the active event goroutines. Basically, if there were two Python apps on two cores instead of one Go app on two cores, the async active event tasks reuired would be nearly double in scenario of Python.
+- Use of BitMap Strings in redis for single seat minute updates in O(1).
+- Use of Redis PubSub for event based delta updates rather than polling state reads.
+
+Small decisions that helps:
+- Query parmaters on search instead of body for Caching
+
+Future Scope:
+- Eliminiate False negatives:
+False negative can happen in 2 cases:
+Case 1: Redis Pod crashes. This results in clearance of all locked seats. Ofcourse booked seats doesn't get afffected from this.
+Case 2: Unlocker service lost. If the unlocker service crashes, then due to the fire-and-forget nature of keyspace notifications, notifications are lost. This can be eliminated or heavily narrowed by a distributed fleet of unlocker pods and using leader consensus to keep single listener. Also, a cron job may run every few hours to read entire radius data and restore the state in the seat_map model.
+
+
+Assumption:
+- False positive of lock state is strictly avoided. But, false negatives are assumed to be acceptable, at least for some time until state is refreshed.
+- On some rare but possible case of crash of redis server, the locking data gets lost. So, I assume its ok, although this can be solved by keeping replicas and mirroring queries.

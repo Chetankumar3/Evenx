@@ -56,7 +56,7 @@ resource "google_compute_firewall" "allow_public_ingress" {
 
   allow {
     protocol = "tcp"
-    ports    = ["80", "3000", "5732", "6379", "8000", "8080]
+    ports    = ["80", "3000", "5732", "6379", "8000", "8080"]
   }
 
   source_ranges = ["0.0.0.0/0"]
@@ -164,8 +164,6 @@ resource "google_compute_instance" "app_server" {
   }
 
   depends_on = [
-    google_storage_bucket_object.env_file,
-    google_storage_bucket_object.ini_file,
     google_storage_bucket_object.static_files
   ]
 }
