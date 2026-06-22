@@ -31,6 +31,7 @@ type Event struct {
 	Location       string     `db:"location"`
 	TotalSeats     int        `db:"total_seats"`
 	AvailableSeats int        `db:"available_seats"`
+	Price          float64    `db:"price"`
 	BannerURL      *string    `db:"bannerurl"`
 	ThumbnailURL   *string    `db:"thumbnailurl"`
 	Model          EventModel `db:"model"`

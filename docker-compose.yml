@@ -1,0 +1,67 @@
+# Local-run orchestration for EvenX. One shared env file feeds every service.
+#   cp Infra/.env.example Infra/.env   then   docker compose up --build
+# Frontend is run separately (cd frontend && npm install && npm run dev) since
+# its repo layout is unconstrained; the three backend services + infra are here.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-evenx}
+      POSTGRES_USER: ${POSTGRES_USER:-evenx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evenx_dev_password}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-evenx}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # Ex => keyspace + expired-event notifications, required by restorer.
+    command: ["redis-server", "--notify-keyspace-events", "Ex"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  main:
+    build:
+      context: ./backend/microservices/main
+      dockerfile: Dockerfile
+    env_file: ./Infra/.env
+    ports:
+      - "${MAIN_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  statesync:
+    build:
+      context: ./backend/microservices/statesync
+      dockerfile: Dockerfile
+    env_file: ./Infra/.env
+    ports:
+      - "${STATESYNC_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  restorer:
+    build:
+      context: ./backend/microservices/restorer
+      dockerfile: Dockerfile
+    env_file: ./Infra/.env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes: {}

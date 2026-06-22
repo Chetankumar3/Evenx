@@ -26,6 +26,7 @@ module.exports = (sequelize) => {
     location: { type: DataTypes.STRING(120), allowNull: false },
     totalSeats: { type: DataTypes.INTEGER, allowNull: false, field: 'total_seats' },
     availableSeats: { type: DataTypes.INTEGER, allowNull: false, field: 'available_seats' }, // eventually-consistent cache; Redis is source of truth
+    price: { type: DataTypes.DECIMAL(10, 2), allowNull: false, defaultValue: 0 }, // per-seat price; booking.amount = price * num_seats
     bannerurl: { type: DataTypes.STRING(500) },
     thumbnailurl: { type: DataTypes.STRING(500) },
     model: { type: DataTypes.ENUM('general', 'seat_map'), allowNull: false, defaultValue: 'general' },

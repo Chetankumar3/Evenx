@@ -25,13 +25,13 @@ build_and_push() {
   echo "${service_name} pushed successfully"
 }
 
-build_and_push "Main service" "evenx-main" "microservices/main/Dockerfile" "." &
+build_and_push "Main service" "evenx-main" "microservices/main/Dockerfile" "microservices/main" &
 pid_main=$!
 
-build_and_push "Restorer service" "evenx-restorer" "microservices/vm_creator/Dockerfile" "." &
+build_and_push "Restorer service" "evenx-restorer" "microservices/restorer/Dockerfile" "microservices/restorer" &
 pid_res=$!
 
-build_and_push "Statesync service" "evenx-statesync" "microservices/loadgen/controller/Dockerfile" "microservices/loadgen/controller" &
+build_and_push "Statesync service" "evenx-statesync" "microservices/statesync/Dockerfile" "microservices/statesync" &
 pid_statesync=$!
 
 status=0

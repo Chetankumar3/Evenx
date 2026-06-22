@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition focus:outline-none focus:ring-2 focus:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-brand-600 text-white hover:bg-brand-700 focus:ring-brand-500;
+  }
+  .btn-ghost {
+    @apply btn border border-slate-300 bg-white text-slate-700 hover:bg-slate-100;
+  }
+  .input {
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500;
+  }
+  .card {
+    @apply overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md;
+  }
+  .label {
+    @apply mb-1 block text-sm font-medium text-slate-700;
+  }
+}
+
+/* Orange "processing" sweep used on a seat awaiting its LOCK ack. */
+.seat-processing {
+  background-image: linear-gradient(
+    100deg,
+    #fb923c 0%,
+    #fdba74 40%,
+    #ffedd5 50%,
+    #fdba74 60%,
+    #fb923c 100%
+  );
+  background-size: 200% 100%;
+  animation: sweep 1.2s linear infinite;
+}

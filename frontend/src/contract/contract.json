@@ -1,0 +1,95 @@
+{
+  "_comment": "SINGLE SOURCE OF TRUTH for all wire-format names shared between the frontend and the backend services (main, statesync, restorer). The React code NEVER hardcodes a field name, action string, endpoint path or status value -- it reads everything from this file. To rename a field on the wire, change it here AND in the corresponding backend service; no frontend component code needs to change.",
+
+  "api": {
+    "baseUrlEnv": "VITE_API_BASE_URL",
+    "wsUrlEnv": "VITE_WS_BASE_URL",
+    "authHeader": "Authorization",
+    "authScheme": "Bearer",
+    "endpoints": {
+      "register": { "method": "POST", "path": "/register" },
+      "login": { "method": "POST", "path": "/login" },
+      "logout": { "method": "POST", "path": "/logout" },
+      "events": { "method": "GET", "path": "/events" },
+      "eventDetails": { "method": "GET", "path": "/event_details/:id" },
+      "search": { "method": "GET", "path": "/search" },
+      "checkout": { "method": "POST", "path": "/events/:eventid/checkout" },
+      "cancelBooking": { "method": "DELETE", "path": "/events/:eventid/cancel/:bookingid" },
+      "cancelSeats": { "method": "DELETE", "path": "/events/:eventid/cancel" },
+      "myBookings": { "method": "GET", "path": "/user/bookings/:userid" }
+    },
+    "wsStreamPath": "/stream/:eventid"
+  },
+
+  "fields": {
+    "auth": {
+      "token": "token",
+      "register": ["name", "email", "username", "mobile", "location", "address", "password"],
+      "login": ["username", "email", "password"]
+    },
+    "user": ["id", "name", "email", "username", "mobile", "location", "address"],
+    "event": [
+      "id", "code", "name", "description", "artists", "dateTime", "venue",
+      "location", "totalSeats", "availableSeats", "price", "bannerurl", "thumbnailurl", "model"
+    ],
+    "booking": ["id", "userId", "eventId", "numSeats", "status", "amount", "paymentRef", "createdAt", "seats"],
+    "checkoutBody": { "general": "num_seats", "seat_map": "seat_nums" },
+    "cancelSeatsBody": "seat_nums"
+  },
+
+  "searchParams": {
+    "location": "location",
+    "hasArtist": "has_artist",
+    "code": "code",
+    "dateFrom": "date_from",
+    "dateTo": "date_to",
+    "query": "q"
+  },
+
+  "ws": {
+    "envelopeFields": {
+      "type": "type",
+      "reqid": "reqid",
+      "action": "action",
+      "success": "success",
+      "seatNum": "seat_num",
+      "numSeats": "num_seats",
+      "avlbl": "avlbl",
+      "book": "book",
+      "failedSeats": "failed_seats",
+      "bitmap": "bitmap",
+      "newStatus": "new_status",
+      "avlblDelta": "avlbl_delta",
+      "token": "token"
+    },
+    "clientActions": {
+      "LOCK": "LOCK",
+      "UNLOCK": "UNLOCK",
+      "DONE": "DONE"
+    },
+    "serverTypes": {
+      "INIT": "INIT"
+    }
+  },
+
+  "enums": {
+    "eventModel": { "general": "general", "seatMap": "seat_map" },
+    "bookingStatus": { "confirmed": "confirmed", "cancelled": "cancelled" }
+  },
+
+  "seatStatus": {
+    "EMPTY": 0,
+    "LOCKED": 1,
+    "BOOKED": 2
+  },
+
+  "messages": {
+    "sessionExpired": "session expired",
+    "insufficientSeats": "Not enough seats available",
+    "lockFailedSeats": "Some seats were just taken. Please pick others.",
+    "bookingConfirmed": "Booking confirmed!",
+    "bookingCancelled": "Booking cancelled.",
+    "loginRequired": "Please log in to continue.",
+    "wsClosed": "Live connection closed."
+  }
+}
